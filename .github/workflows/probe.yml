@@ -1,18 +1,15 @@
 name: probe
 
-# Probes, with the workflow's own GITHUB_TOKEN (the identity lp-webapp's reviewers post as):
-#   1. can it minimize a PR review it posted, and does that hide the review's inline thread?
-#   2. does a REST thread reply add its own review entry to the timeline?
-#   3. can N thread replies ride inside one pending review, so the timeline gains one entry?
-#   4. can it minimize a top-level (issue) comment?
+# Round 2 of the probe, on each push: with the workflow's own GITHUB_TOKEN, post a new summary review
+# carrying a new inline finding, then edit the previous visible summary down to a one-line stub.
+# Question: does the stubbed review keep its open threads visible on the Conversation tab?
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [synchronize]
 
 permissions:
   contents: read
   pull-requests: write
-  issues: write
 
 jobs:
   probe:
@@ -20,58 +17,23 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number }}
-      PR_NODE: ${{ github.event.pull_request.node_id }}
       SHA: ${{ github.event.pull_request.head.sha }}
       REPO: ${{ github.repository }}
     steps:
-      - name: Round-1 summary review with one inline finding
+      - name: Find the newest summary posted so far
         run: |
-          jq -n --arg sha "$SHA" '{commit_id:$sha, event:"COMMENT", body:"Round 1 summary",
-            comments:[{path:"probe.txt", line:1, side:"RIGHT", body:"finding A"}]}' \
-            | gh api "repos/$REPO/pulls/$PR/reviews" -X POST --input - > r1.json
-          jq '{id, node_id, user: .user.login}' r1.json
+          gh api "repos/$REPO/pulls/$PR/reviews" \
+            --jq '[.[] | select(.body | test("summary"))] | last | {id, html_url}' > prev.json
+          cat prev.json
 
-      - name: REST reply to finding A (the way red-panda replies today)
+      - name: Post Round 3 summary with a new inline finding
         run: |
-          cid=$(gh api "repos/$REPO/pulls/$PR/reviews/$(jq -r .id r1.json)/comments" --jq '.[0].id')
-          gh api "repos/$REPO/pulls/$PR/comments/$cid/replies" -X POST -f body="REST reply" \
-            --jq '{id, pull_request_review_id}'
+          jq -n --arg sha "$SHA" '{commit_id:$sha, event:"COMMENT", body:("Newer summary at " + $sha[0:7]),
+            comments:[{path:"probe.txt", line:2, side:"RIGHT", body:("finding at " + $sha[0:7])}]}' \
+            | gh api "repos/$REPO/pulls/$PR/reviews" -X POST --input - --jq '{id, html_url}' > new.json
+          cat new.json
 
-      - name: Round-2 summary carrying two thread replies in one review
+      - name: Edit the previous summary down to a stub
         run: |
-          thread=$(gh api graphql -F o="${REPO%/*}" -F r="${REPO#*/}" -F n="$PR" -f query='query($o:String!,$r:String!,$n:Int!){
-            repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:5){nodes{id}}}}}' \
-            --jq '.data.repository.pullRequest.reviewThreads.nodes[0].id')
-          pending=$(gh api graphql -F pr="$PR_NODE" -f query='mutation($pr:ID!){
-            addPullRequestReview(input:{pullRequestId:$pr}){pullRequestReview{id state}}}' \
-            --jq '.data.addPullRequestReview.pullRequestReview.id')
-          for b in "batched reply 1" "batched reply 2"; do
-            gh api graphql -F rv="$pending" -F t="$thread" -F b="$b" -f query='mutation($rv:ID!,$t:ID!,$b:String!){
-              addPullRequestReviewThreadReply(input:{pullRequestReviewId:$rv,pullRequestReviewThreadId:$t,body:$b}){comment{id}}}' \
-              --jq '.data.addPullRequestReviewThreadReply.comment.id'
-          done
-          gh api graphql -F rv="$pending" -f query='mutation($rv:ID!){
-            submitPullRequestReview(input:{pullRequestReviewId:$rv,event:COMMENT,body:"Round 2 summary"}){pullRequestReview{id state}}}'
-
-      - name: Minimize the round-1 review as OUTDATED
-        run: |
-          gh api graphql -F id="$(jq -r .node_id r1.json)" -f query='mutation($id:ID!){
-            minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized minimizedReason}}}'
-
-      - name: Top-level comment, then minimize it
-        run: |
-          node=$(gh api "repos/$REPO/issues/$PR/comments" -X POST -f body="top-level run log" --jq .node_id)
-          gh api graphql -F id="$node" -f query='mutation($id:ID!){
-            minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized minimizedReason}}}'
-
-      - name: Dump the resulting state
-        if: always()
-        run: |
-          gh api graphql -F o="${REPO%/*}" -F r="${REPO#*/}" -F n="$PR" -f query='query($o:String!,$r:String!,$n:Int!){
-            repository(owner:$o,name:$r){pullRequest(number:$n){
-              reviews(first:20){nodes{body state isMinimized minimizedReason viewerCanMinimize
-                comments(first:10){nodes{body isMinimized}}}}
-              reviewThreads(first:5){nodes{comments(first:10){nodes{body isMinimized pullRequestReview{body}}}}}
-              timelineItems(first:50){nodes{__typename}}}}}' \
-            | jq '.data.repository.pullRequest | {reviews: .reviews.nodes, threads: .reviewThreads.nodes,
-                timeline: (.timelineItems.nodes | group_by(.__typename) | map({(.[0].__typename): length}) | add)}'
+          jq -n --arg url "$(jq -r .html_url new.json)" '{body: ("Superseded by the [newer summary](" + $url + ").")}' \
+            | gh api "repos/$REPO/pulls/$PR/reviews/$(jq -r .id prev.json)" -X PUT --input - --jq '{id, body}'
