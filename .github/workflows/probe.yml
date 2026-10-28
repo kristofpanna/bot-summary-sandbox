@@ -1,8 +1,7 @@
 name: probe
 
-# Round 2 of the probe, on each push: with the workflow's own GITHUB_TOKEN, post a new summary review
-# carrying a new inline finding, then edit the previous visible summary down to a one-line stub.
-# Question: does the stubbed review keep its open threads visible on the Conversation tab?
+# Round 3: post a red-panda-shaped summary (markers + run record + one inline finding), then run the
+# real stub script, exactly as claude-review.yml will.
 on:
   pull_request:
     types: [synchronize]
@@ -20,20 +19,12 @@ jobs:
       SHA: ${{ github.event.pull_request.head.sha }}
       REPO: ${{ github.repository }}
     steps:
-      - name: Find the newest summary posted so far
+      - uses: actions/checkout@v4
+      - name: Post a marker-carrying summary with one inline finding
         run: |
-          gh api "repos/$REPO/pulls/$PR/reviews" \
-            --jq '[.[] | select(.body | test("summary"))] | last | {id, html_url}' > prev.json
-          cat prev.json
-
-      - name: Post Round 3 summary with a new inline finding
-        run: |
-          jq -n --arg sha "$SHA" '{commit_id:$sha, event:"COMMENT", body:("Newer summary at " + $sha[0:7]),
-            comments:[{path:"probe.txt", line:2, side:"RIGHT", body:("finding at " + $sha[0:7])}]}' \
-            | gh api "repos/$REPO/pulls/$PR/reviews" -X POST --input - --jq '{id, html_url}' > new.json
-          cat new.json
-
-      - name: Edit the previous summary down to a stub
-        run: |
-          jq -n --arg url "$(jq -r .html_url new.json)" '{body: ("Superseded by the [newer summary](" + $url + ").")}' \
-            | gh api "repos/$REPO/pulls/$PR/reviews/$(jq -r .id prev.json)" -X PUT --input - --jq '{id, body}'
+          jq -n --arg sha "$SHA" '{commit_id:$sha, event:"COMMENT",
+            body:("🐼 Full summary at " + $sha[0:7] + "\n\n<!-- claude-inline-review -->\n<!-- ai-review-run {\"sha\":\"" + $sha[0:7] + "\",\"findings\":1} -->"),
+            comments:[{path:"probe.txt", line:2, side:"RIGHT", body:("🐼 marker finding at " + $sha[0:7])}]}' \
+            | gh api "repos/$REPO/pulls/$PR/reviews" -X POST --input - --jq '{id, html_url}'
+      - name: Collapse superseded summaries
+        run: bash scripts/stub_superseded_summaries.sh "$REPO" "$PR" '<!-- claude-inline-review -->' '🐼'
